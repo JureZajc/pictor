@@ -1,0 +1,119 @@
+{
+  "updated": "2026-11-22",
+  "source": "https://ollama.com/search?c=vision&c=tools",
+  "mlx_min_ollama": "0.32.12",
+  "models": [
+    {
+      "tag": "qwen3.5:0.8b",
+      "name": "Qwen 3.5 0.8B",
+      "params": "0.8B",
+      "size_gb": 1.2,
+      "mlx": {
+        "tag": "qwen3.5:0.8b-mlx",
+        "size_gb": 1.2
+      },
+      "tier": 1,
+      "note": "Smallest option, for 4 GB GPUs or 8 GB of RAM."
+    },
+    {
+      "tag": "qwen3.5:2b",
+      "name": "Qwen 3.5 2B",
+      "params": "2B",
+      "size_gb": 2.7,
+      "mlx": {
+        "tag": "qwen3.5:2b-mlx",
+        "size_gb": 3.1
+      },
+      "tier": 2,
+      "note": "For 6 GB GPUs and 8 GB Macs."
+    },
+    {
+      "tag": "qwen3.5:4b",
+      "name": "Qwen 3.5 4B",
+      "params": "4B",
+      "size_gb": 3.3,
+      "mlx": {
+        "tag": "qwen3.5:4b-mlx",
+        "size_gb": 4.0
+      },
+      "tier": 3,
+      "note": "For 8 to 10 GB GPUs and CPU-only machines."
+    },
+    {
+      "tag": "qwen3.5:9b",
+      "name": "Qwen 3.5 9B",
+      "params": "9B",
+      "size_gb": 6.6,
+      "tier": 4,
+      "note": "Between the 4B and 12B models, for 11 GB GPUs."
+    },
+    {
+      "tag": "gemma4:12b",
+      "name": "Gemma 4 12B",
+      "params": "12B",
+      "size_gb": 7.7,
+      "mlx": {
+        "tag": "gemma4:12b-mlx",
+        "size_gb": 7.7
+      },
+      "tier": 5,
+      "note": "For 12 to 16 GB GPUs and 16 to 24 GB Macs."
+    },
+    {
+      "tag": "gemma4:26b",
+      "name": "Gemma 4 26B",
+      "params": "26B",
+      "size_gb": 16,
+      "mlx": {
+        "tag": "gemma4:26b-mlx",
+        "size_gb": 18
+      },
+      "tier": 6,
+      "note": "For 24 GB GPUs and 32 GB Macs."
+    },
+    {
+      "tag": "qwen3.8:27b",
+      "name": "Qwen 3.8 27B",
+      "params": "27B",
+      "size_gb": 18,
+      "mlx": {
+        "tag": "qwen3.8:27b-mlx",
+        "size_gb": 18
+      },
+      "tier": 7,
+      "note": "Newest Qwen release, for 32 GB GPUs and 36 GB Macs."
+    },
+    {
+      "tag": "gemma4:31b",
+      "name": "Gemma 4 31B",
+      "params": "31B",
+      "size_gb": 19,
+      "mlx": {
+        "tag": "gemma4:31b-mlx",
+        "size_gb": 19
+      },
+      "tier": 8,
+      "note": "Largest Gemma 4, for 32 GB GPUs and 36 GB Macs."
+    },
+    {
+      "tag": "qwen3.6:35b",
+      "name": "Qwen 3.6 35B",
+      "params": "35B",
+      "size_gb": 23,
+      "mlx": {
+        "tag": "qwen3.6:35b-mlx",
+        "size_gb": 23
+      },
+      "tier": 9,
+      "note": "For 32 GB GPUs and 48 GB Macs."
+    },
+    {
+      "tag": "qwen3.5:122b",
+      "name": "Qwen 3.5 122B",
+      "params": "122B",
+      "size_gb": 81,
+      "tier": 10,
+      "note": "Workstations: over 100 GB of GPU memory, or a 192 GB Mac."
+    }
+  ]
+}

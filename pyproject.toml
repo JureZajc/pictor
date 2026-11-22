@@ -1,0 +1,50 @@
+[project]
+name = "pictor"
+version = "0.1.0"
+description = "Local AI picture agent: choose a picture, say what you want, and a model running on your own machine does it with image tools."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [{ name = "Jure Zajc" }]
+keywords = ["image-editing", "ollama", "local-llm", "agent", "vision"]
+dependencies = [
+    "fastapi>=0.165.0",
+    "httpx2>=2.16.2",
+    "numpy>=2.5.5",
+    "opencv-python-headless>=5.1.0.95",
+    "pillow>=13.0.0",
+    "pillow-heif>=1.0.0",
+    "platformdirs>=4.14.8",
+    "psutil>=7.2.2",
+    "python-multipart>=0.0.34",
+    "rembg[cpu]>=2.0.87",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+pictor = "pictor.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.9,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=1",
+    "ruff>=0.14",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["SIM108"]

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Pictor</title>
+    <link rel="icon" href="/static/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
+          <rect x="3" y="3" width="26" height="26" rx="7" fill="var(--accent)" />
+          <circle cx="21.5" cy="11" r="2.6" fill="var(--accent-ink)" />
+          <path d="M6 23.5 12.5 15l4.5 5 3-3.2 6 6.7z" fill="var(--accent-ink)" />
+        </svg>
+        <span>Pictor</span>
+      </div>
+      <button id="model-button" class="model-chip" type="button" aria-haspopup="dialog">
+        <span class="dot" id="model-dot"></span>
+        <span id="model-name">Loading…</span>
+        <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+          <path d="m4 6 4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+      </button>
+    </header>
+
+    <main class="workspace">
+      <section class="stage" id="stage" aria-label="Picture">
+        <button class="dropzone" id="dropzone" type="button">
+          <svg viewBox="0 0 48 48" width="44" height="44" aria-hidden="true">
+            <rect x="6" y="9" width="36" height="30" rx="5" fill="none" stroke="currentColor" stroke-width="2.2" />
+            <circle cx="17" cy="19" r="3.2" fill="none" stroke="currentColor" stroke-width="2.2" />
+            <path d="m8 34 10-9 7 6 6-5 9 8" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          <strong>Choose a picture</strong>
+          <span>or drop one here, or paste it from the clipboard</span>
+          <small>JPEG, PNG, WebP, HEIC, GIF, BMP, TIFF</small>
+        </button>
+
+        <div class="viewer" id="viewer" hidden>
+          <div class="toolbar" role="toolbar" aria-label="Picture actions">
+            <button type="button" class="btn" id="open-button" title="Open another picture">Open</button>
+            <span class="toolbar-gap"></span>
+            <button type="button" class="btn" id="undo-button" title="Undo (Ctrl/Cmd+Z)">Undo</button>
+            <button type="button" class="btn" id="redo-button" title="Redo (Shift+Ctrl/Cmd+Z)">Redo</button>
+            <button type="button" class="btn" id="compare-button" title="Hold to see the original">Compare</button>
+            <span class="toolbar-fill"></span>
+            <a class="btn primary" id="download-button" href="#" download>Download</a>
+          </div>
+          <div class="canvas" id="canvas">
+            <img id="picture" alt="The picture being edited" draggable="false" />
+            <div class="canvas-badge" id="compare-badge" hidden>Original</div>
+          </div>
+          <div class="meta" id="meta"></div>
+          <ol class="versions" id="versions" aria-label="Versions"></ol>
+        </div>
+      </section>
+
+      <section class="chat" aria-label="Conversation">
+        <div class="messages" id="messages" aria-live="polite"></div>
+        <form class="composer" id="composer">
+          <textarea id="prompt" rows="1" placeholder="Open a picture first" aria-label="What should be done with the picture" disabled></textarea>
+          <button type="submit" class="btn primary send" id="send-button" disabled>Send</button>
+        </form>
+      </section>
+    </main>
+
+    <dialog id="setup" class="setup" aria-labelledby="setup-title">
+      <div id="setup-body"></div>
+    </dialog>
+
+    <div id="toasts" class="toasts" role="status"></div>
+    <input type="file" id="file-input" accept="image/*,.heic,.heif" hidden />
+    <script type="module" src="/static/app.js"></script>
+  </body>
+</html>
