@@ -1,14 +1,19 @@
-"""Shared fixtures: an isolated profile, a synthetic picture and a scripted fake Ollama."""
+"""Shared fixtures: an isolated profile, a synthetic picture, a scripted fake Ollama and a
+fake image generator."""
 
 from __future__ import annotations
 
 import copy
 import io
+import threading
+from collections.abc import Callable, Iterator
 
+import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 
 from pictor.catalog import InstalledModel
+from pictor.generation import Availability, GenerationCancelled
 from pictor.session import Session, SessionStore
 
 ALL_CAPABILITIES = ("completion", "vision", "tools", "thinking")
@@ -103,6 +108,9 @@ class FakeOllama:
         self.running = running
         self.requests: list[dict] = []
         self.pulled: list[str] = []
+        #: What Ollama holds in memory, tag -> GB, and what it was told to drop.
+        self.in_memory: dict[str, float] = {}
+        self.unloaded: list[str] = []
 
     async def version(self) -> str | None:
         return "0.40.16" if self.running else None
@@ -128,6 +136,13 @@ class FakeOllama:
 
     async def installed(self) -> list[InstalledModel]:
         return list(self.models)
+
+    async def loaded(self) -> dict[str, float]:
+        return dict(self.in_memory)
+
+    async def unload(self, model: str) -> None:
+        self.unloaded.append(model)
+        self.in_memory.pop(model, None)
 
     async def pull(self, model: str):
         self.pulled.append(model)
@@ -156,3 +171,105 @@ class FakeOllama:
 
     async def aclose(self) -> None:
         pass
+
+
+MAGENTA = (230, 30, 200)
+
+
+class FakeGenerator:
+    """Stands in for the image model: paints a disc into the picture it is given.
+
+    ``at`` is where the disc goes, as fractions of the picture's width and height. Give a
+    list to paint somewhere else on each successive call. ``drift`` shifts every pixel a
+    little, the way a real model does.
+    """
+
+    memory_gb = 8.5
+    download_bytes = 16_000_000_000
+    setup_memory_gb = 16.0
+
+    def __init__(
+        self,
+        at: tuple[float, float] | list[tuple[float, float] | None] = (0.5, 0.5),
+        radius: float = 0.2,
+        color: tuple[int, int, int] = MAGENTA,
+        drift: int = 0,
+        state: str = "ready",
+        error: Exception | None = None,
+        wait_for_cancel: bool = False,
+        setup_events: list[dict] | None = None,
+        setup_error: Exception | None = None,
+    ) -> None:
+        self.at = at
+        self.radius = radius
+        self.color = color
+        self.drift = drift
+        self.state = state
+        self.error = error
+        self.wait_for_cancel = wait_for_cancel
+        self.setup_events = setup_events
+        self.setup_error = setup_error
+        self.calls: list[dict] = []
+        self.started = threading.Event()
+        self.was_cancelled = False
+        self.setups = 0
+
+    def available(self) -> Availability:
+        reasons = {
+            "unsupported": "Painting new things needs an Apple Silicon Mac.",
+            "not_installed": "mflux is not installed.",
+            "no_weights": "The image model has not been downloaded yet.",
+        }
+        return Availability(self.state, reasons.get(self.state, ""))
+
+    def edit(
+        self,
+        image: Image.Image,
+        prompt: str,
+        *,
+        seed: int,
+        status: Callable[[str], None],
+        cancelled: threading.Event,
+    ) -> Image.Image:
+        number = len(self.calls)
+        self.calls.append({"prompt": prompt, "seed": seed, "size": image.size, "image": image})
+        self.started.set()
+        status("Loading the image model…")
+        if self.wait_for_cancel:
+            self.was_cancelled = cancelled.wait(10)
+            raise GenerationCancelled("Stopped.")
+        if self.error is not None:
+            raise self.error
+        status("Painting: step 1 of 4…")
+        spot = self.at[min(number, len(self.at) - 1)] if isinstance(self.at, list) else self.at
+        result = image.convert("RGB")
+        if self.drift:
+            shifted = np.asarray(result, dtype=np.int16) + self.drift
+            result = Image.fromarray(np.clip(shifted, 0, 255).astype(np.uint8))
+        if spot is not None:
+            x, y = spot[0] * image.width, spot[1] * image.height
+            r = self.radius * min(image.size)
+            ImageDraw.Draw(result).ellipse((x - r, y - r, x + r, y + r), fill=self.color)
+        return result
+
+    def setup(self, cancelled: threading.Event | None = None) -> Iterator[dict]:
+        self.setups += 1
+        events = self.setup_events or [
+            {
+                "status": "Downloading the image model",
+                "completed": 500,
+                "total": 1000,
+                "percent": 50.0,
+            },
+            {"status": "Preparing the image model…", "percent": None},
+        ]
+        yield from events
+        if self.setup_error is not None:
+            raise self.setup_error
+        self.state = "ready"
+        yield {"status": "The image model is ready.", "percent": 100.0}
+
+
+@pytest.fixture
+def generator() -> FakeGenerator:
+    return FakeGenerator()

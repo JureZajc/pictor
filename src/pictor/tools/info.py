@@ -53,7 +53,7 @@ def get_image_info(ctx: ToolContext) -> ToolResult:
     return ToolResult("\n".join(lines))
 
 
-@tool("Look", requires_vision=True)
+@tool("Look", requires={"vision"})
 def view_image(ctx: ToolContext) -> ToolResult:
     """Look at the picture as it is right now. Use it to check the result of an edit that
     depended on position, such as a crop, a blurred region, or text and shapes you placed.

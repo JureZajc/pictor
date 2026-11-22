@@ -4,7 +4,15 @@ Importing this package registers every tool. To add one, write a function in any
 here, decorate it with ``@tool("Label")`` and import the module below.
 """
 
-from pictor.tools import background, color, draw, geometry, info, regions  # noqa: F401
+from pictor.tools import (  # noqa: F401
+    background,
+    color,
+    draw,
+    generative,
+    geometry,
+    info,
+    regions,
+)
 from pictor.tools.registry import (
     Tool,
     ToolContext,

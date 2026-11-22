@@ -1,13 +1,15 @@
+import asyncio
 import base64
+import contextlib
 import io
 
 from PIL import Image
 
-from pictor.agent import Agent, encode_for_model, explain_failure, resolve_think
+from pictor.agent import Agent, encode_for_model, explain_failure, limits_note, resolve_think
 from pictor.config import Config
 from pictor.ollama import OllamaError
 from pictor.tools import ToolRegistry, ToolResult
-from tests.conftest import FakeOllama, call, calls, say
+from tests.conftest import FakeGenerator, FakeOllama, call, calls, say
 
 MODEL = "gemma4:12b"
 
@@ -282,6 +284,146 @@ async def test_a_crashing_tool_does_not_end_the_run(session):
     end = next(e for e in events if e["type"] == "tool_end")
     assert end["ok"] is False and "failed unexpectedly (boom)" in end["result"]
     assert events[-1]["type"] == "done"
+
+
+# ---------------------------------------------------------------- painting new things
+
+DOG = {"description": "a small brown dog", "left": 55, "top": 10, "right": 95, "bottom": 45}
+
+
+def painting_agent(script, generator, budget_gb: float = 16.8) -> tuple[Agent, FakeOllama]:
+    fake = FakeOllama(script)
+    return Agent(fake, Config(model=MODEL), budget_gb=budget_gb, generator=generator), fake
+
+
+async def test_the_model_can_paint_something_new_when_a_generator_is_set_up(session, generator):
+    agent, fake = painting_agent([call("add_object", **DOG), say("Added a dog.")], generator)
+    events = await collect(agent, session, "add a small brown dog on the right")
+
+    request = fake.requests[0]
+    offered = {tool["function"]["name"] for tool in request["tools"]}
+    assert {"add_object", "remove_object"} <= offered
+    system = request["messages"][0]["content"]
+    assert "call add_object" in system and "call remove_object" in system
+    assert "such as generating new content" not in system
+
+    assert [v.label for v in session.versions] == ["Original", "Add object"]
+    assert session.image().size == (640, 480)
+    start = next(e for e in events if e["type"] == "tool_start")
+    assert (start["name"], start["label"], start["args"]) == ("add_object", "Add object", DOG)
+    notes = [e["text"] for e in events if e["type"] == "tool_status"]
+    assert notes == ["Loading the image model…", "Painting: step 1 of 4…"]
+    end = next(e for e in events if e["type"] == "tool_end")
+    assert end["ok"] and end["result"].startswith("Painted a small brown dog into the region")
+    assert end["version"]["label"] == "Add object"
+    assert end["version"]["detail"] == "a small brown dog"
+    assert kinds(events).count("state") == 1 and events[-1]["steps"] == 1
+    # The model is shown the result, so it can judge what the image model painted.
+    look = fake.requests[1]["messages"][-1]
+    assert look["role"] == "user" and len(look["images"]) == 1
+    assert generator.calls[0]["prompt"].startswith("Add a small brown dog to this picture")
+
+
+async def test_without_a_generator_painting_is_not_offered_and_the_model_is_told_so(session):
+    for generator in (None, FakeGenerator(state="no_weights"), FakeGenerator(state="unsupported")):
+        agent, fake = painting_agent(
+            [call("add_object", **DOG), say("I cannot do that.")], generator
+        )
+        events = await collect(agent, session, "add a dog")
+
+        request = fake.requests[0]
+        offered = {tool["function"]["name"] for tool in request["tools"]}
+        assert "add_object" not in offered and "remove_object" not in offered
+        assert "such as generating new content" in request["messages"][0]["content"]
+        # A model that calls it anyway is answered like for any unknown tool.
+        end = next(e for e in events if e["type"] == "tool_end")
+        assert end["ok"] is False and "no tool named 'add_object'" in end["result"]
+        assert "add_object" not in end["result"].split("Available tools:")[1]
+        assert session.cursor == 0
+        if generator is not None:
+            assert generator.calls == []
+
+
+def test_the_system_prompt_only_promises_what_the_tools_can_do():
+    nothing = limits_note(["crop", "resize"])
+    assert "cannot be done with your tools, such as generating new content" in nothing
+    adding = limits_note(["crop", "add_object"])
+    assert "call add_object" in adding and "remove_object" not in adding
+    assert "Erasing an object" in adding  # still not possible without the removal tool
+    # Where painting could be set up, the model points the user to the switch.
+    hint = limits_note(["crop", "resize"], can_be_switched_on=True)
+    assert "cannot be done with your tools" in hint and "'Add things to pictures'" in hint
+    assert "Add things to pictures" not in nothing
+    both = limits_note(["add_object", "remove_object"])
+    assert "call remove_object" in both and "Erasing an object" not in both
+    assert "repainting the whole picture" in both
+
+
+async def test_the_language_model_steps_aside_when_both_do_not_fit_in_memory(session, generator):
+    agent, fake = painting_agent([call("add_object", **DOG), say("Added a dog.")], generator)
+    fake.in_memory = {MODEL: 11.1}  # plus 8.5 GB for the image model: over the 16.8 GB budget
+    events = await collect(agent, session, "add a dog")
+
+    assert fake.unloaded == [MODEL]
+    notes = [e["text"] for e in events if e["type"] == "tool_status"]
+    assert notes[0].startswith("Making room in memory") and "Painting: step 1 of 4…" in notes
+    # Nothing reloads it by hand: the next request does, and the user is told why it waits.
+    order = kinds(events)
+    waking = [i for i, e in enumerate(events) if e.get("text") == "Waking the model again…"]
+    assert len(waking) == 1 and order[waking[0]] == "status"
+    assert order.index("tool_end") < waking[0] < order.index("text")
+    assert session.cursor == 1
+
+
+async def test_the_language_model_stays_loaded_when_there_is_room(session, generator):
+    agent, fake = painting_agent(
+        [call("add_object", **DOG), say("Added a dog.")], generator, budget_gb=33.6
+    )
+    fake.in_memory = {MODEL: 11.1}
+    events = await collect(agent, session, "add a dog")
+    assert fake.unloaded == [] and session.cursor == 1
+    assert not any("Making room" in e.get("text", "") for e in events)
+    assert not any(e.get("text") == "Waking the model again…" for e in events)
+
+
+async def wait_for(condition, seconds: float = 3.0) -> bool:
+    deadline = asyncio.get_running_loop().time() + seconds
+    while asyncio.get_running_loop().time() < deadline:
+        if condition():
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
+async def test_stopping_the_run_tells_a_tool_that_is_still_working(session):
+    generator = FakeGenerator(wait_for_cancel=True)  # paints until it is told to stop
+    agent, _ = painting_agent([call("add_object", **DOG)], generator)
+    seen = []
+
+    async def consume() -> None:
+        async for event in agent.run(session, "add a dog"):
+            seen.append(event["type"])
+
+    task = asyncio.ensure_future(consume())
+    assert await wait_for(generator.started.is_set)
+    assert not generator.was_cancelled
+    task.cancel()  # what the server does when the browser's Stop closes the stream
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+    assert await wait_for(lambda: generator.was_cancelled)
+    assert "tool_end" not in seen and session.cursor == 0
+    assert session.turns == []  # a stopped exchange is not remembered
+
+
+async def test_closing_the_event_stream_also_stops_the_tool(session):
+    generator = FakeGenerator(wait_for_cancel=True)
+    agent, _ = painting_agent([call("add_object", **DOG)], generator)
+    stream = agent.run(session, "add a dog")
+    async for event in stream:
+        if event["type"] == "tool_status":
+            break
+    await stream.aclose()
+    assert await wait_for(lambda: generator.was_cancelled)
 
 
 # ---------------------------------------------------------------- limits and failures

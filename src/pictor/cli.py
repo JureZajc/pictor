@@ -12,7 +12,7 @@ import sys
 import threading
 import webbrowser
 
-from pictor import __version__, catalog, hardware
+from pictor import __version__, catalog, generation, hardware
 from pictor.config import Config
 from pictor.ollama import DOWNLOAD_URL, Ollama, OllamaError
 
@@ -81,6 +81,23 @@ async def _doctor(config: Config) -> int:
         chosen = "*" if option.tag == config.model else " "
         print(f" {chosen} {option.tag:<44} {option.need_gb:>5g} GB  {', '.join(flags)}")
     print(f"\nChosen model: {config.model or 'none yet (picked on first start)'}")
+
+    painter = generation.MfluxGenerator.from_config(config)
+    painting = generation.describe(painter, config)
+    words = {
+        "unsupported": "not available on this kind of computer",
+        "not_installed": f"mflux is not installed ({generation.INSTALL_COMMAND})",
+        "no_weights": "mflux is installed, the image model is not downloaded yet",
+        "ready": "ready",
+    }
+    print("\nAdding things to pictures (optional)")
+    print(f"  Image generator  {words[painting['state']]}")
+    if painting["supported"]:
+        print(f"  Switched on      {'yes' if painting['enabled'] else 'no'}")
+    if painting["installed"]:
+        print(f"  Program          {painter.program}")
+        print(f"  Image model      {config.image_model}, {config.image_quantize} bits")
+        print(f"  Prepared copy    {painter.prepared() or 'not made yet'}")
     print(f"Settings file: {Config.path()}")
     return 0 if version else 1
 

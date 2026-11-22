@@ -172,6 +172,19 @@ class Ollama:
         found = await asyncio.gather(*(describe(entry) for entry in entries))
         return [model for model in found if model]
 
+    async def loaded(self) -> dict[str, float]:
+        """The models Ollama holds in memory right now, as tag -> size in GB."""
+        data = await self._json("GET", "/api/ps")
+        return {
+            str(entry.get("name") or entry.get("model")): round((entry.get("size") or 0) / 1e9, 2)
+            for entry in data.get("models") or []
+            if entry.get("name") or entry.get("model")
+        }
+
+    async def unload(self, model: str) -> None:
+        """Have Ollama drop a model from memory now. It loads again on its next use."""
+        await self._json("POST", "/api/generate", {"model": model, "keep_alive": 0})
+
     async def pull(self, model: str) -> AsyncIterator[dict]:
         """Download a model, yielding progress with an overall ``percent`` when known."""
         totals: dict[str, int] = {}
