@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import inspect
 import re
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -18,9 +19,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 from pydantic.fields import FieldInfo
 
 if TYPE_CHECKING:
+    from pictor.generation import ImageGenerator
     from pictor.session import Session
 
 _NUMBER_WITH_UNIT = re.compile(r"^\s*(-?\d+(?:\.\d+)?)\s*(%|px|pixels?|deg|degrees?|°)?\s*$", re.I)
+
+
+#: Everything a tool may require of a run.
+FEATURES = frozenset({"vision", "generation"})
 
 
 class ToolError(Exception):
@@ -48,6 +54,14 @@ class ToolContext:
     status: Callable[[str], None] = lambda _text: None
     #: Settings from the user's config that some tools read.
     settings: dict[str, Any] = field(default_factory=dict)
+    #: Set when the user stops the run. A tool that takes more than a moment watches it
+    #: and gives up, because a worker thread cannot be stopped from outside.
+    cancelled: threading.Event = field(default_factory=threading.Event)
+    #: Paints new content into a picture, or ``None`` when no image generator is set up.
+    generator: ImageGenerator | None = None
+    #: Asks for this many GB of memory to be free before a large job. Returns ``True``
+    #: when the language model was unloaded to make the room; it reloads by itself.
+    make_room: Callable[[float], bool] = lambda _need_gb: False
 
     @property
     def image(self) -> Image.Image:
@@ -96,8 +110,9 @@ class Tool:
     description: str
     func: Callable[..., ToolResult]
     args_model: type[BaseModel]
-    #: Only offered to models that can see pictures.
-    requires_vision: bool = False
+    #: What a run must have for this tool to be offered: "vision" (the model can see
+    #: pictures) and "generation" (an image generator is set up).
+    requires: frozenset[str] = frozenset()
 
     def schema(self) -> dict:
         parameters = _strip_titles(self.args_model.model_json_schema())
@@ -128,8 +143,15 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
 
-    def tool(self, label: str, *, requires_vision: bool = False) -> Callable:
-        """Register the decorated function as a tool named after it."""
+    def tool(self, label: str, *, requires: Iterable[str] = ()) -> Callable:
+        """Register the decorated function as a tool named after it.
+
+        ``requires`` names the features a run must have for the tool to be offered.
+        """
+        needs = frozenset(requires)
+        unknown = needs - FEATURES
+        if unknown:
+            raise ValueError(f"Unknown tool requirement: {', '.join(sorted(unknown))}")
 
         def decorate(func: Callable[..., ToolResult]) -> Callable[..., ToolResult]:
             signature = inspect.signature(func, eval_str=True)
@@ -146,7 +168,7 @@ class ToolRegistry:
                 description=" ".join((func.__doc__ or "").split()),
                 func=func,
                 args_model=args_model,
-                requires_vision=requires_vision,
+                requires=needs,
             )
             return func
 
@@ -155,14 +177,18 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
-    def available(self, vision: bool = True) -> list[Tool]:
-        return [t for t in self._tools.values() if vision or not t.requires_vision]
+    def available(self, features: Iterable[str] | None = None) -> list[Tool]:
+        """The tools a run with these features is offered. ``None`` means every tool."""
+        if features is None:
+            return list(self._tools.values())
+        have = frozenset(features)
+        return [t for t in self._tools.values() if t.requires <= have]
 
-    def schemas(self, vision: bool = True) -> list[dict]:
-        return [t.schema() for t in self.available(vision)]
+    def schemas(self, features: Iterable[str] | None = None) -> list[dict]:
+        return [t.schema() for t in self.available(features)]
 
-    def names(self, vision: bool = True) -> list[str]:
-        return [t.name for t in self.available(vision)]
+    def names(self, features: Iterable[str] | None = None) -> list[str]:
+        return [t.name for t in self.available(features)]
 
 
 registry = ToolRegistry()

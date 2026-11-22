@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import logging
-from collections.abc import AsyncIterator
+import threading
+from collections.abc import AsyncIterator, Callable, Collection
 from dataclasses import dataclass
 
 import numpy as np
@@ -29,6 +31,7 @@ from PIL import Image
 
 from pictor.catalog import suggest_num_ctx
 from pictor.config import Config
+from pictor.generation import ImageGenerator
 from pictor.ollama import Ollama, OllamaError
 from pictor.session import Session, has_transparency
 from pictor.tools import ToolContext, ToolError, ToolRegistry, ToolResult, registry
@@ -37,6 +40,8 @@ log = logging.getLogger("pictor.agent")
 
 #: How many earlier instructions the model is reminded of.
 MAX_HISTORY_TURNS = 6
+#: Longest wait, in seconds, for Ollama to let go of a model it was asked to unload.
+UNLOAD_WAIT_SECONDS = 15.0
 
 SYSTEM_PROMPT = """\
 You are Pictor, an assistant that edits one picture for the user by calling tools. \
@@ -60,9 +65,7 @@ Doing it well
 anonymize_faces to hide faces, change_background for background effects.
 - If an edit came out wrong, call undo_last_edit and try again with better values \
 instead of stacking a correction on top.
-- If something cannot be done with your tools, such as generating new content or \
-erasing an object and inventing what was behind it, say so plainly and offer the \
-closest thing you can do.
+{limits}
 - If the request is unclear in a way that matters, ask one short question instead of \
 guessing.
 
@@ -77,6 +80,50 @@ _VISION_NO = (
     "You cannot see pictures, so use get_image_info and detect_faces to learn about it, "
     "and tell the user when a request needs you to see the picture."
 )
+#: Sent with the picture when a tool asked for the model to see the result. Without the
+#: second sentence a model takes the picture for a new request and answers "How else
+#: can I help?" instead of saying what it did.
+_LOOK = (
+    "Here is the picture as it is now, for you to check. This is not a new request: if "
+    "the user's request is done, say what you did, and if the result is wrong, undo it "
+    "and try again."
+)
+_CANNOT_GENERATE = (
+    "- If something cannot be done with your tools, such as generating new content or "
+    "erasing an object and inventing what was behind it, say so plainly and offer the "
+    "closest thing you can do."
+)
+_SWITCH_ON = (
+    "When the user asks to add something new to the picture or to erase something, also "
+    "tell them that Pictor can do this once the optional image generator is switched on: "
+    "it is in the model menu in the top right corner, under 'Add things to pictures'."
+)
+_CAN_ADD = (
+    "- To put something new into the picture, such as an animal, a person or an object, "
+    "call add_object. Choose the region where the thing could really stand, lie or hang, "
+    "and make the region about as large as the thing should appear. It paints with a "
+    "second AI model and takes half a minute or more, so call it once per thing."
+)
+_CAN_REMOVE = (
+    "- To take something out of the picture and fill in what was behind it, call "
+    "remove_object with a region that covers the whole thing."
+)
+_CANNOT_REMOVE = (
+    "- Erasing an object and inventing what was behind it cannot be done with your "
+    "tools; say so plainly and offer the closest thing you can do."
+)
+_CANNOT_REPAINT = (
+    "- If something else cannot be done with your tools, such as repainting the whole "
+    "picture in another style, say so plainly and offer the closest thing you can do."
+)
+
+
+def limits_note(tool_names: Collection[str], can_be_switched_on: bool = False) -> str:
+    """The system prompt's lines about new content, matching the tools on offer."""
+    if "add_object" not in tool_names:
+        return f"{_CANNOT_GENERATE} {_SWITCH_ON}" if can_be_switched_on else _CANNOT_GENERATE
+    removal = _CAN_REMOVE if "remove_object" in tool_names else _CANNOT_REMOVE
+    return "\n".join((_CAN_ADD, removal, _CANNOT_REPAINT))
 
 
 @dataclass(frozen=True)
@@ -171,11 +218,17 @@ class Agent:
         config: Config,
         budget_gb: float,
         tools: ToolRegistry = registry,
+        generator: ImageGenerator | None = None,
     ) -> None:
         self.client = client
         self.config = config
         self.budget_gb = budget_gb
         self.tools = tools
+        #: Paints new content for the tools that need it. ``None`` switches them off.
+        self.generator = generator
+        #: Whether this computer could paint if the user set the generator up. Lets the
+        #: model point to the setting when asked for something it cannot do yet.
+        self.painting_possible = False
 
     async def describe(self, model: str) -> ModelInfo:
         details = await self.client.show(model)
@@ -186,6 +239,43 @@ class Agent:
             tools="tools" in capabilities,
             think=resolve_think(self.config.think, details),
         )
+
+    async def features(self, info: ModelInfo) -> frozenset[str]:
+        """What this run has that some tools require: see ``Tool.requires``."""
+        have = set()
+        if info.vision:
+            have.add("vision")
+        # The check looks at the disk for the program and its weights, so it runs off the
+        # event loop.
+        generator = self.generator
+        if generator is not None and (await asyncio.to_thread(generator.available)).ok:
+            have.add("generation")
+        return frozenset(have)
+
+    async def make_room(self, need_gb: float, say: Callable[[str], None]) -> bool:
+        """Unload the language model if it and a job of ``need_gb`` do not fit together.
+
+        Nothing has to be done afterwards: Ollama loads the model again on the next
+        request. Returns whether anything was unloaded.
+        """
+        try:
+            loaded = await self.client.loaded()
+        except OllamaError:
+            return False  # cannot tell; the job reports its own failure if memory runs out
+        if not loaded or sum(loaded.values()) + need_gb <= self.budget_gb:
+            return False
+        say("Making room in memory: the language model steps aside for a moment…")
+        for tag in loaded:
+            with contextlib.suppress(OllamaError):
+                await self.client.unload(tag)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + UNLOAD_WAIT_SECONDS
+        while loop.time() < deadline:
+            with contextlib.suppress(OllamaError):
+                if not await self.client.loaded():
+                    break
+            await asyncio.sleep(0.25)
+        return True
 
     async def run(self, session: Session, text: str) -> AsyncIterator[dict]:
         """Carry out one instruction from the user on the session's picture."""
@@ -205,17 +295,25 @@ class Agent:
             }
             return
 
-        system = SYSTEM_PROMPT.format(vision=_VISION_YES if info.vision else _VISION_NO)
+        features = await self.features(info)
+        system = SYSTEM_PROMPT.format(
+            vision=_VISION_YES if info.vision else _VISION_NO,
+            limits=limits_note(self.tools.names(features), self.painting_possible),
+        )
         user: dict = {"role": "user", "content": f"{text}\n\n{picture_note(session)}"}
         if info.vision:
             user["images"] = [encode_for_model(session.image(), self.config.vision_max_side)]
         turn: list[dict] = [user]
         history = [m for past in session.turns[-MAX_HISTORY_TURNS:] for m in past]
         messages = [{"role": "system", "content": system}, *history, *turn]
-        schemas = self.tools.schemas(info.vision)
+        schemas = self.tools.schemas(features)
         options = {"num_ctx": self.config.num_ctx or suggest_num_ctx(self.budget_gb)}
 
         loop = asyncio.get_running_loop()
+        # A tool runs in a worker thread, which cannot be interrupted. This is how a
+        # slow one learns that the user pressed Stop.
+        cancelled = threading.Event()
+        reloading = False
         call_count = 0
         last_edit: str | None = None
         limit_reached = True
@@ -223,6 +321,9 @@ class Agent:
 
         try:
             for _step in range(self.config.max_steps):
+                if reloading:
+                    reloading = False
+                    yield {"type": "status", "text": "Waking the model again…"}
                 content, thinking, calls = "", "", []
                 async for chunk in self.client.chat(
                     model, messages, tools=schemas, think=info.think, options=options
@@ -256,7 +357,7 @@ class Agent:
                     call_count += 1
                     call_id = f"t{call_count}"
                     tool = self.tools.get(name)
-                    if tool and tool.requires_vision and not info.vision:
+                    if tool and not tool.requires <= features:
                         tool = None
                     yield {
                         "type": "tool_start",
@@ -269,7 +370,7 @@ class Agent:
                     result: ToolResult | None = None
                     signature = json.dumps([name, arguments], sort_keys=True, default=str)
                     if tool is None:
-                        known = ", ".join(self.tools.names(info.vision))
+                        known = ", ".join(self.tools.names(features))
                         outcome = f"There is no tool named {name!r}. Available tools: {known}."
                     elif signature == last_edit:
                         outcome = (
@@ -282,11 +383,30 @@ class Agent:
                         def report(text: str, queue: asyncio.Queue = statuses) -> None:
                             loop.call_soon_threadsafe(queue.put_nowait, text)
 
+                        unloaded: list[bool] = []
+
+                        def make_room(
+                            need_gb: float,
+                            say: Callable[[str], None] = report,
+                            done: list[bool] = unloaded,
+                        ) -> bool:
+                            freeing = asyncio.run_coroutine_threadsafe(
+                                self.make_room(need_gb, say), loop
+                            )
+                            done.append(freeing.result(timeout=UNLOAD_WAIT_SECONDS * 2))
+                            return done[-1]
+
                         ctx = ToolContext(
                             session=session,
                             vision=info.vision,
                             status=report,
-                            settings={"background_model": self.config.background_model},
+                            settings={
+                                "background_model": self.config.background_model,
+                                "image_max_side": self.config.image_max_side,
+                            },
+                            cancelled=cancelled,
+                            generator=self.generator if "generation" in features else None,
+                            make_room=make_room,
                         )
                         task = asyncio.ensure_future(asyncio.to_thread(tool.run, ctx, arguments))
                         while not task.done():
@@ -311,6 +431,7 @@ class Agent:
                         except Exception as exc:  # noqa: BLE001 - a tool bug must not end the run
                             log.exception("Tool %s failed", name)
                             outcome = f"Error: the tool failed unexpectedly ({exc})."
+                        reloading = reloading or any(unloaded)
 
                     version = None
                     if result is not None:
@@ -335,7 +456,7 @@ class Agent:
                 if show_picture and info.vision:
                     look = {
                         "role": "user",
-                        "content": f"Here is the picture as it is now. {picture_note(session)}",
+                        "content": f"{_LOOK} {picture_note(session)}",
                         "images": [encode_for_model(session.image(), self.config.vision_max_side)],
                     }
                     messages.append(look)
@@ -343,6 +464,11 @@ class Agent:
         except OllamaError as exc:
             yield {"type": "error", "message": explain_failure(str(exc), model)}
             return
+        finally:
+            # Also reached when the browser's Stop closes the stream mid-tool. Nothing can
+            # be awaited or yielded here then; setting the flag is enough for the tool to
+            # stop its own work (the image generator kills its process).
+            cancelled.set()
 
         if limit_reached:
             note = (

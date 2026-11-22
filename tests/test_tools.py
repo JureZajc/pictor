@@ -1,7 +1,7 @@
 import pytest
 from PIL import Image, ImageChops
 
-from pictor.tools import ToolContext, ToolError, registry
+from pictor.tools import ToolContext, ToolError, ToolRegistry, registry
 from pictor.tools import background as background_tools
 from pictor.tools import regions as region_tools
 from pictor.tools.common import parse_color, parse_ratio
@@ -50,9 +50,24 @@ def test_every_tool_describes_itself_for_the_model():
 
 
 def test_view_image_is_only_offered_to_models_that_can_see():
-    assert "view_image" in registry.names(vision=True)
-    assert "view_image" not in registry.names(vision=False)
-    assert len(registry.schemas(vision=False)) == len(registry.schemas()) - 1
+    assert "view_image" in registry.names({"vision"})
+    assert "view_image" not in registry.names(set())
+    assert len(registry.schemas(set())) == len(registry.schemas({"vision"})) - 1
+
+
+def test_painting_tools_are_only_offered_when_an_image_generator_is_set_up():
+    plain, painting = registry.names({"vision"}), registry.names({"vision", "generation"})
+    assert "add_object" not in plain and "remove_object" not in plain
+    assert set(painting) - set(plain) == {"add_object", "remove_object"}
+    assert "view_image" not in registry.names({"generation"})
+    # Asking without saying what the run has lists everything.
+    assert set(registry.names()) == set(painting)
+
+
+def test_a_tool_cannot_require_something_no_run_can_have():
+    tools = ToolRegistry()
+    with pytest.raises(ValueError, match="Unknown tool requirement: telepathy"):
+        tools.tool("Mind reader", requires={"telepathy"})
 
 
 def test_numbers_written_with_units_are_understood(session):

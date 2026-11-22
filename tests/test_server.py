@@ -7,15 +7,37 @@ from PIL import Image
 
 from pictor.catalog import InstalledModel
 from pictor.config import Config
+from pictor.generation import GenerationError
 from pictor.server import create_app
-from tests.conftest import ALL_CAPABILITIES, FakeOllama, call, encode, make_photo, say
+from tests.conftest import (
+    ALL_CAPABILITIES,
+    FakeGenerator,
+    FakeOllama,
+    call,
+    encode,
+    make_photo,
+    say,
+)
 
 MODEL = "gemma4:12b"
 LOCAL = "http://127.0.0.1:8765"
 
 
-def make_client(fake: FakeOllama, config: Config | None = None, **options) -> TestClient:
-    app = create_app(config or Config(model=MODEL), client=fake, start_ollama=False, **options)
+def make_client(
+    fake: FakeOllama,
+    config: Config | None = None,
+    generator: FakeGenerator | None = None,
+    **options,
+) -> TestClient:
+    # Never the real image generator: what is installed on this machine must not matter.
+    generator = generator or FakeGenerator(state="not_installed")
+    app = create_app(
+        config or Config(model=MODEL),
+        client=fake,
+        start_ollama=False,
+        painter=lambda _config: generator,
+        **options,
+    )
     return TestClient(app, base_url=LOCAL)
 
 
@@ -151,6 +173,131 @@ def test_think_setting_is_validated_and_saved(client):
     assert client.post("/api/settings", json={"think": "off"}).json()["think"] == "off"
     assert Config.load().think == "off"
     assert client.post("/api/settings", json={"think": "maybe"}).status_code == 400
+
+
+# ---------------------------------------------------------------- painting new things
+
+
+@pytest.mark.parametrize(
+    ("state", "supported", "installed", "ready"),
+    [
+        ("unsupported", False, False, False),
+        ("not_installed", True, False, False),
+        ("no_weights", True, True, False),
+        ("ready", True, True, True),
+    ],
+)
+def test_status_tells_the_four_states_of_the_image_generator_apart(
+    fake, state, supported, installed, ready
+):
+    with make_client(fake, generator=FakeGenerator(state=state)) as client:
+        status = client.get("/api/status").json()
+    painting = status["generation"]
+    assert (painting["state"], painting["supported"]) == (state, supported)
+    assert (painting["installed"], painting["ready"]) == (installed, ready)
+    # Nothing is switched on, or offered to the model, without the user asking for it.
+    assert painting["enabled"] is False and painting["active"] is False
+    assert painting["busy"] is False
+    assert painting["install_command"].startswith("uv tool install mflux==")
+    assert painting["download_gb"] == 16.0 and painting["model"] == "flux2-klein-4b"
+    assert bool(painting["reason"]) is not ready
+    assert not any(tool["name"] == "add_object" for tool in status["tools"])
+
+
+def test_setting_up_streams_progress_and_switches_painting_on(fake):
+    generator = FakeGenerator(state="no_weights")
+    with make_client(fake, generator=generator) as client:
+        events = stream(client, "/api/generation/setup", {})
+        assert [e["type"] for e in events] == ["progress", "progress", "progress", "done"]
+        assert events[0] == {
+            "type": "progress",
+            "status": "Downloading the image model",
+            "completed": 500,
+            "total": 1000,
+            "percent": 50.0,
+        }
+        assert events[1]["status"] == "Preparing the image model…"
+        assert generator.setups == 1
+
+        status = client.get("/api/status").json()
+        painting = status["generation"]
+        assert painting["ready"] and painting["enabled"] and painting["active"]
+        assert any(tool["name"] == "add_object" for tool in status["tools"])
+        assert Config.load().image_generator == "mflux"  # remembered for the next start
+
+
+def test_a_failed_setup_is_reported_and_leaves_painting_off(fake):
+    generator = FakeGenerator(state="no_weights", setup_error=GenerationError("The disk is full."))
+    with make_client(fake, generator=generator) as client:
+        events = stream(client, "/api/generation/setup", {})
+        assert events[-1] == {"type": "error", "message": "The disk is full."}
+        assert [e["type"] for e in events[:-1]] == ["progress", "progress"]
+        painting = client.get("/api/status").json()["generation"]
+        assert painting["enabled"] is False and painting["busy"] is False
+        assert Config.load().image_generator == "off"
+
+
+def test_the_model_is_told_where_painting_can_be_switched_on(fake):
+    for state, hinted in (("no_weights", True), ("ready", True), ("unsupported", False)):
+        fake.requests.clear()
+        fake.script = [say("I cannot paint a dog into it.")]
+        with make_client(fake, generator=FakeGenerator(state=state)) as client:
+            sid = upload(client)["id"]
+            stream(client, f"/api/session/{sid}/chat", {"message": "add a dog"})
+        system = fake.requests[0]["messages"][0]["content"]
+        assert ("'Add things to pictures'" in system) is hinted
+
+
+def test_setup_is_refused_when_it_cannot_work(fake):
+    for state, words in (("unsupported", "Apple Silicon"), ("not_installed", "not installed")):
+        generator = FakeGenerator(state=state)
+        with make_client(fake, generator=generator) as client:
+            refused = client.post("/api/generation/setup", json={})
+            assert refused.status_code == 409 and words in refused.json()["detail"]
+            assert generator.setups == 0
+
+
+def test_the_language_model_makes_room_for_the_setup(fake):
+    fake.in_memory = {MODEL: 11.1}
+    with make_client(fake, generator=FakeGenerator(state="no_weights")) as client:
+        stream(client, "/api/generation/setup", {})
+    assert fake.unloaded == [MODEL]
+
+
+def test_painting_can_be_switched_off_and_on_again(fake):
+    config = Config(model=MODEL, image_generator="mflux")
+    with make_client(fake, config, generator=FakeGenerator()) as client:
+        assert client.get("/api/status").json()["generation"]["active"] is True
+        off = client.post("/api/settings", json={"image_generator": "off"}).json()
+        assert off["generation"]["enabled"] is False and off["generation"]["ready"] is True
+        assert Config.load().image_generator == "off"
+        on = client.post("/api/settings", json={"image_generator": "mflux"}).json()
+        assert on["generation"]["active"] is True
+        assert client.post("/api/settings", json={"image_generator": "dall-e"}).status_code == 400
+
+
+def test_a_new_object_is_painted_over_http_only_when_painting_is_on(fake):
+    dog = {"description": "a small brown dog", "left": 55, "top": 10, "right": 95, "bottom": 45}
+    generator = FakeGenerator()
+    with make_client(fake, generator=generator) as client:  # ready, but not switched on
+        sid = upload(client)["id"]
+        fake.script = [call("add_object", **dog), say("I cannot paint.")]
+        events = stream(client, f"/api/session/{sid}/chat", {"message": "add a dog"})
+        end = next(e for e in events if e["type"] == "tool_end")
+        assert end["ok"] is False and "no tool named" in end["result"]
+        assert generator.calls == []
+
+        client.post("/api/settings", json={"image_generator": "mflux"})
+        fake.script = [call("add_object", **dog), say("Added a dog.")]
+        events = stream(client, f"/api/session/{sid}/chat", {"message": "add a dog"})
+        end = next(e for e in events if e["type"] == "tool_end")
+        assert end["ok"] is True and end["version"]["label"] == "Add object"
+        assert [e["text"] for e in events if e["type"] == "tool_status"] == [
+            "Loading the image model…",
+            "Painting: step 1 of 4…",
+        ]
+        state = client.get(f"/api/session/{sid}").json()["state"]
+        assert state["cursor"] == 1 and (state["width"], state["height"]) == (640, 480)
 
 
 # ---------------------------------------------------------------- pictures

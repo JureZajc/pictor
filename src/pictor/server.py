@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
+import threading
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from importlib import resources
 from pathlib import Path
@@ -16,9 +17,15 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from pictor import __version__, catalog, hardware
+from pictor import __version__, catalog, generation, hardware
 from pictor.agent import Agent
-from pictor.config import THINK_MODES, Config
+from pictor.config import IMAGE_GENERATORS, THINK_MODES, Config
+from pictor.generation import (
+    GenerationCancelled,
+    GenerationError,
+    InstallableGenerator,
+    MfluxGenerator,
+)
 from pictor.ollama import DOWNLOAD_URL, Ollama, OllamaError
 from pictor.session import MAX_UPLOAD_BYTES, ImageLoadError, Session, SessionStore
 from pictor.tools import registry
@@ -35,6 +42,7 @@ class ModelChoice(BaseModel):
 
 class Settings(BaseModel):
     think: str | None = None
+    image_generator: str | None = None
 
 
 class ChatRequest(BaseModel):
@@ -125,12 +133,24 @@ def create_app(
     client: Ollama | None = None,
     allow_remote: bool = False,
     start_ollama: bool = True,
+    painter: Callable[[Config], InstallableGenerator] = MfluxGenerator.from_config,
 ) -> FastAPI:
+    """Build the app. ``painter`` makes the image generator for the current settings."""
     config = config or Config.load()
     client = client or Ollama(config.resolved_ollama_host)
     store = SessionStore()
     machine = hardware.detect()
     agent = Agent(client, config, machine.budget_gb)
+    #: Held while the image model is being downloaded and prepared.
+    setting_up = asyncio.Lock()
+
+    def use_painter() -> None:
+        """Give the agent its image generator, or take it away, as the settings say."""
+        candidate = painter(config)
+        agent.generator = candidate if config.image_generator != "off" else None
+        agent.painting_possible = candidate.available().state != "unsupported"
+
+    use_painter()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -199,6 +219,12 @@ def create_app(
     async def status() -> dict:
         version = await client.version()
         model = await model_status() if version else None
+        # Looks at the disk for the program and its weights, so not on the event loop.
+        painting = await asyncio.to_thread(generation.describe, painter(config), config)
+        painting["busy"] = setting_up.locked()
+        features = {"vision"} if model is None or model.get("vision", True) else set()
+        if painting["active"]:
+            features.add("generation")
         return {
             "version": __version__,
             "ollama": {
@@ -212,7 +238,8 @@ def create_app(
             "model": model,
             "think": config.think,
             "ready": bool(model and model.get("installed") and model.get("tools")),
-            "tools": [{"name": t.name, "label": t.label} for t in registry.available()],
+            "tools": [{"name": t.name, "label": t.label} for t in registry.available(features)],
+            "generation": painting,
         }
 
     @app.get("/api/models")
@@ -267,8 +294,70 @@ def create_app(
             if body.think not in THINK_MODES:
                 raise HTTPException(400, f"think must be one of {', '.join(THINK_MODES)}.")
             config.think = body.think
+        if body.image_generator is not None:
+            if body.image_generator not in IMAGE_GENERATORS:
+                choices = ", ".join(IMAGE_GENERATORS)
+                raise HTTPException(400, f"image_generator must be one of {choices}.")
+            config.image_generator = body.image_generator
+            use_painter()
         config.save()
         return await status()
+
+    @app.post("/api/generation/setup")
+    async def setup_painting() -> StreamingResponse:
+        """Download and prepare the image model, then switch painting on.
+
+        This is the only place that starts the large download, and only on a click.
+        """
+        candidate = painter(config)
+        state = await asyncio.to_thread(candidate.available)
+        if state.state in ("unsupported", "not_installed"):
+            raise HTTPException(409, state.reason)
+        if setting_up.locked():
+            raise HTTPException(409, "The image model is already being set up.")
+        if store.busy():
+            raise HTTPException(409, "The agent is still working. Try again when it is done.")
+
+        async def events() -> AsyncIterator[dict]:
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue[dict] = asyncio.Queue()
+            stop = threading.Event()
+
+            def tell(event: dict) -> None:
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+
+            def work() -> None:
+                try:
+                    for progress in candidate.setup(stop):
+                        tell({"type": "progress", **progress})
+                    tell({"type": "done"})
+                except GenerationCancelled:
+                    tell({"type": "error", "message": "Stopped."})
+                except GenerationError as exc:
+                    tell({"type": "error", "message": str(exc)})
+                except Exception as exc:  # noqa: BLE001 - the stream must end with an answer
+                    log.exception("Setting up the image generator failed")
+                    tell({"type": "error", "message": f"Setting up failed unexpectedly ({exc})."})
+
+            async with setting_up:
+                try:
+                    # Preparing loads the whole model once; the language model makes room.
+                    await agent.make_room(candidate.setup_memory_gb, lambda _text: None)
+                    worker = asyncio.ensure_future(asyncio.to_thread(work))
+                    while True:
+                        event = await queue.get()
+                        if event["type"] == "done":
+                            config.image_generator = "mflux"
+                            config.save()
+                            use_painter()
+                        yield event
+                        if event["type"] != "progress":
+                            break
+                    await worker
+                finally:
+                    stop.set()  # the browser went away: stop the download as well
+
+        return ndjson(events())
 
     # ------------------------------------------------------------------ pictures
 

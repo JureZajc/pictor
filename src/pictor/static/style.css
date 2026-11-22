@@ -783,6 +783,38 @@ select {
   color: var(--accent);
 }
 
+.panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 2px;
+}
+
+.panel-actions .grow {
+  flex: 1;
+  min-width: 0;
+}
+
+.panel .command {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 6px 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.panel .command code {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 13px;
+  white-space: nowrap;
+  user-select: all;
+}
+
 .facts {
   display: flex;
   flex-wrap: wrap;

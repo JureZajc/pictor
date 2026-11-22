@@ -16,6 +16,9 @@ from platformdirs import user_cache_dir, user_config_dir
 APP_NAME = "pictor"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 THINK_MODES = ("auto", "off", "default")
+IMAGE_GENERATORS = ("off", "mflux")
+#: The quantization levels mflux accepts for ``-q``.
+IMAGE_QUANTIZE_LEVELS = (3, 4, 5, 6, 8)
 
 
 def config_dir() -> Path:
@@ -68,6 +71,18 @@ class Config:
     background_model: str = "isnet-general-use"
     #: Where Ollama listens. ``None`` follows ``OLLAMA_HOST`` or the default port.
     ollama_host: str | None = None
+    #: What paints new objects into a picture: "off", or "mflux" once it is set up.
+    image_generator: str = "off"
+    #: The image model, passed to mflux as ``--model``.
+    image_model: str = "flux2-klein-4b"
+    #: Bits per weight the image model is loaded with. Fewer bits need less memory.
+    image_quantize: int = 8
+    #: Denoising steps. Four is what the distilled klein models are made for.
+    image_steps: int = 4
+    #: Longest side, in pixels, of the part of the picture handed to the image model.
+    image_max_side: int = 1024
+    #: Use mflux's experimental small text encoder: less memory, weaker prompts.
+    image_small_text_encoder: bool = False
 
     @property
     def resolved_ollama_host(self) -> str:
@@ -89,6 +104,19 @@ class Config:
         config = cls(**{k: v for k, v in raw.items() if k in known})
         if config.think not in THINK_MODES:
             config.think = "auto"
+        # A hand-edited file must not be able to break the image generator's command line.
+        defaults = cls()
+        if config.image_generator not in IMAGE_GENERATORS:
+            config.image_generator = defaults.image_generator
+        if config.image_quantize not in IMAGE_QUANTIZE_LEVELS:
+            config.image_quantize = defaults.image_quantize
+        if not isinstance(config.image_model, str) or not config.image_model.strip():
+            config.image_model = defaults.image_model
+        for key, low, high in (("image_steps", 1, 50), ("image_max_side", 256, 2048)):
+            value = getattr(config, key)
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                setattr(config, key, getattr(defaults, key))
+        config.image_small_text_encoder = config.image_small_text_encoder is True
         return config
 
     def save(self) -> None:

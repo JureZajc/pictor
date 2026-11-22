@@ -168,3 +168,25 @@ async def test_ensure_running_does_nothing_when_ollama_answers_or_is_missing(mon
     missing = client_for(refuse)
     assert await missing.ensure_running(wait=0.1) is None
     assert missing._process is None
+
+
+async def test_models_in_memory_are_listed_and_can_be_unloaded():
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/ps":
+            return httpx.Response(
+                200,
+                json={"models": [{"name": "gemma4:12b-mlx", "size": 11_100_000_000}, {"size": 5}]},
+            )
+        sent.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"done": True, "done_reason": "unload"})
+
+    client = client_for(handler)
+    assert await client.loaded() == {"gemma4:12b-mlx": 11.1}
+    await client.unload("gemma4:12b-mlx")
+    # Ollama's documented way to drop a model now: an empty request that keeps it for 0 s.
+    assert sent == [("/api/generate", {"model": "gemma4:12b-mlx", "keep_alive": 0})]
+
+    idle = client_for(lambda request: httpx.Response(200, json={"models": []}))
+    assert await idle.loaded() == {}

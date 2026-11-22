@@ -324,6 +324,10 @@ class SessionStore:
     def get(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
+    def busy(self) -> bool:
+        """Whether the agent is working on any open picture right now."""
+        return any(session.lock.locked() for session in self._sessions.values())
+
     def create(self, data: bytes, filename: str) -> Session:
         if len(data) > MAX_UPLOAD_BYTES:
             raise ImageLoadError("That file is larger than 80 MB.")

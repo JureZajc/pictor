@@ -27,7 +27,16 @@ const app = {
   busy: false,
   controller: null,
   comparing: false,
-  setup: { models: null, choice: null, custom: "", pull: null, error: "", timer: null },
+  setup: {
+    models: null,
+    choice: null,
+    custom: "",
+    pull: null,
+    error: "",
+    timer: null,
+    paint: null, // progress while the image model is downloaded and prepared
+    paintError: "",
+  },
 };
 
 const SUGGESTIONS = [
@@ -37,6 +46,8 @@ const SUGGESTIONS = [
   "Blur the faces",
   "Describe this picture",
 ];
+// Offered only when the image generator is switched on.
+const PAINT_SUGGESTION = "Add a small dog";
 
 // ---------------------------------------------------------------- server calls
 
@@ -398,8 +409,8 @@ function renderChat() {
         h(
           "div",
           { class: "suggestions" },
-          SUGGESTIONS.map((text) =>
-            h("button", { type: "button", class: "btn", onclick: () => send(text) }, text),
+          (app.status?.generation?.active ? [...SUGGESTIONS, PAINT_SUGGESTION] : SUGGESTIONS).map(
+            (text) => h("button", { type: "button", class: "btn", onclick: () => send(text) }, text),
           ),
         ),
       ),
@@ -491,9 +502,16 @@ async function send(text) {
     });
     for await (const event of ndjson(response)) {
       const pinned = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 80;
-      if (event.type === "status" && pending) {
-        pending.text = event.text;
-        pendingView.update();
+      if (event.type === "status") {
+        // Also between steps, e.g. while the model loads again after an image was painted.
+        if (!pending) {
+          pending = { type: "pending", text: event.text };
+          pendingView = partView(pending);
+          view.element.append(pendingView.element);
+        } else {
+          pending.text = event.text;
+          pendingView.update();
+        }
       } else if (event.type === "thinking" || event.type === "text") {
         streamInto(event.type, event.delta);
       } else if (event.type === "tool_start") {
@@ -743,6 +761,8 @@ function renderSetup() {
   );
 
   scroll.append(
+    // Above the long model list, or nobody would find it.
+    !firstRun && paintingPanel(),
     list,
     h(
       "details",
@@ -814,6 +834,161 @@ function renderSetupFoot(foot) {
     children.push(h("button", { type: "button", class: "btn primary", disabled, onclick: confirmModel }, label));
   }
   foot.replaceChildren(...children);
+}
+
+/** The optional second model that paints new things into a picture. */
+function paintingPanel() {
+  const painting = app.status?.generation;
+  if (!painting) return null;
+  const setup = app.setup;
+  const panel = h("div", { class: "panel painting", id: "painting-panel" });
+  panel.append(h("h2", {}, "Add things to pictures (optional)"));
+  const what =
+    "Paints something new into a picture, such as an animal, or takes something out, with a second AI model.";
+
+  if (!painting.supported) {
+    panel.append(
+      h("p", {}, what),
+      h("p", { class: "muted" }, "It runs on Apple Silicon Macs and on Linux with an NVIDIA card, so it is not available on this computer."),
+    );
+    return panel;
+  }
+
+  if (!painting.installed) {
+    panel.append(
+      h("p", {}, what),
+      h(
+        "p",
+        {},
+        "It needs one more program: ",
+        h("a", { href: "https://github.com/filipstrand/mflux", target: "_blank", rel: "noreferrer" }, "mflux"),
+        ", free and open source. Install it by running this in a terminal:",
+      ),
+      h(
+        "div",
+        { class: "command" },
+        h("code", {}, painting.install_command),
+        h("button", { type: "button", class: "btn", onclick: () => copyText(painting.install_command) }, "Copy"),
+      ),
+      h(
+        "div",
+        { class: "panel-actions" },
+        h("span", { class: "grow muted" }, "About 1.1 GB. The image model itself is downloaded in the next step."),
+        h("button", { type: "button", class: "btn", onclick: loadSetup }, "Check again"),
+      ),
+    );
+    return panel;
+  }
+
+  if (setup.paint) {
+    const { percent, completed, total, status } = setup.paint;
+    const known = typeof percent === "number" && total > 0;
+    const detail = known
+      ? `${status} · ${gigabytes(completed / 1e9)} of ${gigabytes(total / 1e9)} (${Math.round(percent)}%)`
+      : status || "Starting…";
+    panel.append(
+      h("div", {}, detail),
+      h("div", { class: `progress ${known ? "" : "indeterminate"}` }, h("div", { style: known ? `width:${percent}%` : "" })),
+      h(
+        "div",
+        { class: "panel-actions" },
+        h("span", { class: "grow muted" }, "You can close this dialog meanwhile; it carries on."),
+        h("button", { type: "button", class: "btn", onclick: cancelPainting }, "Cancel"),
+      ),
+    );
+    return panel;
+  }
+
+  const memory = `about ${gigabytes(painting.memory_gb)} of memory`;
+  if (painting.enabled && painting.ready) {
+    panel.append(
+      h("p", {}, h("span", { class: "badge fits" }, "On"), " Ask for something like “add a small brown dog on the grass on the right”."),
+      h(
+        "div",
+        { class: "panel-actions" },
+        h("span", { class: "grow muted" }, `Each addition takes about half a minute and needs ${memory}; the language model steps aside meanwhile.`),
+        h("button", { type: "button", class: "btn", onclick: () => switchPainting(false) }, "Turn off"),
+      ),
+    );
+    return panel;
+  }
+
+  const size = painting.download_gb ? ` (${gigabytes(painting.download_gb)})` : "";
+  const label = painting.ready ? "Turn on" : `Download${size} and turn on`;
+  const cost = painting.ready
+    ? "The image model is already on this computer. Turning it on prepares it, which takes a few seconds."
+    : `One download${size} from Hugging Face: FLUX.2 klein 4B by Black Forest Labs, Apache-2.0 licence. After that it works offline.`;
+  panel.append(
+    h("p", {}, what),
+    h(
+      "div",
+      { class: "panel-actions" },
+      h("span", { class: setup.paintError ? "grow warning" : "grow muted" }, setup.paintError || cost),
+      h("button", { type: "button", class: "btn", disabled: Boolean(setup.pull), onclick: setUpPainting }, label),
+    ),
+  );
+  return panel;
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("Copied.");
+  } catch {
+    toast("Could not copy; select the text instead.", "error");
+  }
+}
+
+function renderPainting() {
+  // Only the panel, so a download does not disturb what is typed or chosen elsewhere.
+  const current = $("#painting-panel");
+  const next = paintingPanel();
+  if (current && next) current.replaceWith(next);
+  else if ($("#setup").open) renderSetup();
+}
+
+async function setUpPainting() {
+  const setup = app.setup;
+  if (setup.paint) return;
+  const controller = new AbortController();
+  setup.paint = { controller, status: "Starting…" };
+  setup.paintError = "";
+  renderPainting();
+  try {
+    const response = await api("/api/generation/setup", { json: {}, signal: controller.signal, raw: true });
+    for await (const event of ndjson(response)) {
+      if (event.type === "error") throw new Error(event.message);
+      if (event.type === "progress") {
+        // A step without numbers must not keep showing the previous step's numbers.
+        setup.paint = { controller, percent: null, completed: 0, total: 0, ...event };
+        renderPainting();
+      }
+    }
+    setup.paint = null;
+    await refreshStatus();
+    if (!app.transcript.length) renderChat(); // the suggestions gain one
+    toast("Pictor can now add things to pictures.");
+  } catch (error) {
+    setup.paint = null;
+    setup.paintError =
+      error.name === "AbortError" ? "Cancelled. A download resumes where it stopped next time." : error.message;
+    await refreshStatus().catch(() => {});
+  }
+  renderPainting();
+}
+
+function cancelPainting() {
+  app.setup.paint?.controller.abort();
+}
+
+async function switchPainting(on) {
+  try {
+    app.status = await api("/api/settings", { json: { image_generator: on ? "mflux" : "off" } });
+    if (!app.transcript.length) renderChat();
+  } catch (error) {
+    toast(error.message, "error");
+  }
+  renderPainting();
 }
 
 async function loadSetup() {
